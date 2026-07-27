@@ -1,9 +1,11 @@
 // Command acrpush is a one-shot poller of the Azure Log Analytics query API
 // (mallcoppro-29f), sibling to cmd/loganalytics. It surfaces
-// acrnostrrelayprod's DATA-PLANE registry-content events — image pushes and
-// deletes surfaced via the acr-diag-to-law diagnostic setting
-// (nostr-relay/infra/prod.bicep) into the ContainerRegistryRepositoryEvents
-// Log Analytics table — as normalized mallcop events.
+// acrnostrrelayprod's DATA-PLANE registry-content events — image pushes,
+// deletes, and imports (`az acr import`, a distinct OperationName that pulls
+// an image from an arbitrary external source registry into ours) surfaced
+// via the acr-diag-to-law diagnostic setting (nostr-relay/infra/prod.bicep)
+// into the ContainerRegistryRepositoryEvents Log Analytics table — as
+// normalized mallcop events.
 //
 // Why a separate command rather than extending cmd/loganalytics: that
 // connector is hardcoded to ONE table (ContainerAppConsoleLogs_CL) and ONE
@@ -63,18 +65,24 @@ var queryBase = "https://api.loganalytics.io/v1/workspaces/%s/query"
 
 // kqlQuery is THE query, verbatim, every run — a constant string, never
 // string-interpolated with config or the time window (same discipline as
-// cmd/loganalytics's kqlQuery). Filtered server-side to Push/Delete only:
-// Pull and other read-shaped operations carry no supply-chain-mutation
-// signal (see internal/normalize/acr.go's doc comment) and would otherwise
-// dominate the row volume for no detection value. The time window is bound
-// separately via the request body's "timespan" field (see connector.query).
+// cmd/loganalytics's kqlQuery). Filtered server-side to Push/Delete/
+// importImage only: Pull and other read-shaped operations carry no
+// supply-chain-mutation signal (see internal/normalize/acr.go's doc comment)
+// and would otherwise dominate the row volume for no detection value.
+// importImage (ACR's operation for `az acr import`) is included alongside
+// Push/Delete because it pulls an image from an ARBITRARY EXTERNAL source
+// registry into ours — a supply-chain injection vector, verified live
+// 2026-07-27 landing as its own distinct OperationName in
+// ContainerRegistryRepositoryEvents (previously silently excluded here,
+// 0 rows). The time window is bound separately via the request body's
+// "timespan" field (see connector.query).
 //
 // Repository is NOT filtered to "nostr-relay-prod" (unlike cmd/loganalytics's
 // ContainerAppName_s filter): acrnostrrelayprod is a single-repository
 // registry today, but nothing about this query depends on that being
 // permanent, and repository name is carried in the payload either way.
 const kqlQuery = `ContainerRegistryRepositoryEvents
-| where OperationName in ("Push", "Delete")
+| where OperationName in ("Push", "Delete", "importImage")
 | order by TimeGenerated asc
 | project TimeGenerated, OperationName, Repository, Tag, Digest, Identity, CallerIpAddress, LoginServer, ResultType`
 
