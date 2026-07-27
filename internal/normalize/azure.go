@@ -5,12 +5,57 @@ import (
 	"strings"
 )
 
+// CosmosRoleResolver resolves a Cosmos DB SQL role assignment's role name and
+// principal ID via a supplementary ARM control-plane GET, for the case where
+// the Activity Log's BeginRequest event carries no requestbody at ALL (see
+// the sqlRoleAssignments cases below) -- unlike Microsoft.Authorization/
+// roleAssignments/write and ContainerRegistry/registries/write, which DO
+// carry a requestbody and never need this (mallcoppro-32e, live-verified
+// 2026-07-21/27: a real Cosmos SQL RBAC grant's captured event has no
+// requestbody under any observed field). resourceID is the sqlRoleAssignments
+// resource ID from the Activity Log entry
+// (".../databaseAccounts/<acct>/sqlRoleAssignments/<guid>"). ok is true only
+// when at least the principal was resolved; a resolver that can't reach ARM
+// or gets a non-200 must return ("", "", false) rather than erroring --
+// enrichment is best-effort and must never fail the scan.
+type CosmosRoleResolver func(resourceID string) (roleName, principalID string, ok bool)
+
+// azureConfig holds Azure()'s optional supplementary-lookup configuration.
+type azureConfig struct {
+	cosmosRoleResolver CosmosRoleResolver
+}
+
+// AzureOption configures optional supplementary behavior for Azure(). Kept
+// out of Azure()'s required signature (via variadic opts) so normalize.Azure
+// stays pure/testable by default and every existing 2-arg caller keeps
+// compiling unchanged.
+type AzureOption func(*azureConfig)
+
+// WithCosmosRoleResolver configures Azure() to fall back to a supplementary
+// ARM GET (cmd/azure's resolveCosmosRole) when role/principal can't be
+// extracted from the Activity Log entry itself. This is the one deliberate
+// exception to "normalize-only": Baron authorized it (mallcoppro-32e) because
+// without it, every real Cosmos SQL RBAC grant ships with an empty
+// role/principal and priv-escalation can't attribute WHO got WHICH Cosmos
+// data-plane role.
+func WithCosmosRoleResolver(r CosmosRoleResolver) AzureOption {
+	return func(c *azureConfig) { c.cosmosRoleResolver = r }
+}
+
 // Azure maps a raw Azure Activity Log entry to canonical mallcop events.
 //
 // opName is operationName.value (e.g. "Microsoft.Authorization/roleAssignments/write").
 // entry is the JSON-decoded raw Activity Log entry. Azure puts the actor in
 // "caller", the resource in "resourceId", and detail under "properties".
-func Azure(opName string, entry map[string]any) []Result {
+//
+// opts is optional supplementary configuration (currently just
+// WithCosmosRoleResolver); callers that don't need it pass none, and the
+// function behaves exactly as before.
+func Azure(opName string, entry map[string]any, opts ...AzureOption) []Result {
+	cfg := &azureConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
 	props := subMap(entry, "properties")
 	resourceID := mapStr(entry, "resourceId")
 	caller := mapStr(entry, "caller")
@@ -346,6 +391,19 @@ func Azure(opName string, entry map[string]any) []Result {
 			role = firstNonEmpty(role, mapStr(rb, "roleDefinitionName"), mapStr(rb, "roleDefinitionId"))
 			principal = firstNonEmpty(principal, mapStr(rb, "principalId"))
 		}
+		// mallcoppro-32e: the Cosmos sqlRoleAssignments BeginRequest event
+		// carries NO requestbody at all (unlike roleAssignments/write and
+		// ContainerRegistry/registries/write, which do) -- role/principal
+		// ship empty for every real grant with only the reads above. When a
+		// resolver is configured and either field is still unresolved, make a
+		// supplementary ARM GET on the assignment resource. Nil resolver or
+		// ok=false keeps today's best-effort empty behavior (no regression).
+		if (role == "" || principal == "") && cfg.cosmosRoleResolver != nil {
+			if rn, pid, ok := cfg.cosmosRoleResolver(resourceID); ok {
+				role = firstNonEmpty(role, rn)
+				principal = firstNonEmpty(principal, pid)
+			}
+		}
 		cd := map[string]any{"action": "role_assignment"}
 		set(cd, "resource_name", resourceID)
 		set(cd, "policy_name", role)
@@ -375,6 +433,14 @@ func Azure(opName string, entry map[string]any) []Result {
 		if rb := azureRequestBodyProps(props); rb != nil {
 			role = firstNonEmpty(role, mapStr(rb, "roleDefinitionName"), mapStr(rb, "roleDefinitionId"))
 			principal = firstNonEmpty(principal, mapStr(rb, "principalId"))
+		}
+		// See the /write case above (mallcoppro-32e): same supplementary-GET
+		// fallback, since the delete's BeginRequest event is equally bodyless.
+		if (role == "" || principal == "") && cfg.cosmosRoleResolver != nil {
+			if rn, pid, ok := cfg.cosmosRoleResolver(resourceID); ok {
+				role = firstNonEmpty(role, rn)
+				principal = firstNonEmpty(principal, pid)
+			}
 		}
 		cd := map[string]any{"action": "role_assignment"}
 		set(cd, "resource_name", resourceID)

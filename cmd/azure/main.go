@@ -45,6 +45,25 @@ const (
 // httptest.Server instead of the real Azure management endpoint.
 var activityLogBase = "https://management.azure.com/subscriptions/%s/providers/microsoft.insights/eventtypes/management/values"
 
+// managementBase is the ARM control-plane host used by supplementary GETs
+// (currently just resolveCosmosRole). A var (not const), mirroring
+// activityLogBase's override idiom, so tests can point it at an
+// httptest.Server.
+var managementBase = "https://management.azure.com"
+
+// cosmosSQLRoleAPIVersion is the Cosmos DB SQL RBAC control-plane API
+// version used to GET a sqlRoleAssignments resource (mallcoppro-32e).
+const cosmosSQLRoleAPIVersion = "2023-04-15"
+
+// cosmosBuiltInRoleNames maps the two well-known BUILT-IN Cosmos DB SQL role
+// definition GUIDs (Azure-documented, stable across every subscription) to
+// their display names, so priv-escalation's detectors see a human-readable
+// role instead of a bare GUID.
+var cosmosBuiltInRoleNames = map[string]string{
+	"00000000-0000-0000-0000-000000000001": "Cosmos DB Built-in Data Reader",
+	"00000000-0000-0000-0000-000000000002": "Cosmos DB Built-in Data Contributor",
+}
+
 var cursorRE = regexp.MustCompile(`^[A-Za-z0-9+/=_\-&?%:.]+$`)
 
 func validateCursor(cursor string) error {
@@ -186,7 +205,11 @@ type activityLogEntry struct {
 // the next run to skip every real event between the true high-water mark and
 // now). Callers must gate maxSeen updates on tsReliable, not merely on
 // ev.Timestamp being non-zero.
-func normalizeEntry(entry map[string]interface{}, subscriptionID string) ([]*event.Event, bool, error) {
+//
+// azureOpts is passed straight through to normalize.Azure (currently just
+// carries WithCosmosRoleResolver from fetchActivityLog); it's variadic so
+// every existing 2-arg call (tests included) keeps compiling unchanged.
+func normalizeEntry(entry map[string]interface{}, subscriptionID string, azureOpts ...normalize.AzureOption) ([]*event.Event, bool, error) {
 	// Extract caller (actor).
 	actor, _ := entry["caller"].(string)
 
@@ -225,7 +248,7 @@ func normalizeEntry(entry map[string]interface{}, subscriptionID string) ([]*eve
 	}
 	baseID := sha256Hex(idStr)
 
-	results := normalize.Azure(opName, entry)
+	results := normalize.Azure(opName, entry, azureOpts...)
 	out := make([]*event.Event, 0, len(results))
 	for i, r := range results {
 		payload, err := r.PayloadJSON(entry)
@@ -269,6 +292,78 @@ func (c *connector) get(ctx context.Context, rawURL string) (*http.Response, err
 	req.Header.Set("Authorization", "Bearer "+c.accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	return c.client.Do(req)
+}
+
+// cosmosRoleAssignmentGet is the subset of a Cosmos DB SQL role-assignment
+// resource's ARM GET response this connector needs.
+type cosmosRoleAssignmentGet struct {
+	Properties struct {
+		PrincipalID      string `json:"principalId"`
+		RoleDefinitionID string `json:"roleDefinitionId"`
+	} `json:"properties"`
+}
+
+// lastPathSegment returns the final "/"-delimited segment of s (e.g. the bare
+// GUID off the end of a roleDefinitionId resource path).
+func lastPathSegment(s string) string {
+	if s == "" {
+		return ""
+	}
+	parts := strings.Split(s, "/")
+	return parts[len(parts)-1]
+}
+
+// resolveCosmosRole is a normalize.CosmosRoleResolver: it makes a
+// supplementary ARM control-plane GET on a Cosmos DB SQL role-assignment
+// resource to recover role/principal detail the Activity Log entry itself
+// never carries (mallcoppro-32e -- live-verified 2026-07-21/27: the Cosmos
+// sqlRoleAssignments BeginRequest event has NO requestbody at all, unlike
+// Microsoft.Authorization/roleAssignments/write and ContainerRegistry/
+// registries/write, which do and so never need this).
+//
+// resourceID already starts with "/subscriptions/..." (as read straight off
+// the Activity Log entry's resourceId field), so it's appended directly to
+// managementBase. Deliberately a SINGLE GET: builtin role GUIDs are mapped to
+// names locally; a custom (non-builtin) roleDefinitionId falls back to its
+// raw last path segment rather than triggering a second GET to resolve a
+// custom role's display name.
+//
+// Best-effort only -- enrichment must never fail or crash a scan. Any
+// transport error, non-200 status, or unparseable body logs a warning to
+// stderr and returns ok=false; the caller (normalize.Azure) keeps its
+// pre-existing best-effort-empty behavior in that case.
+func (c *connector) resolveCosmosRole(resourceID string) (roleName, principalID string, ok bool) {
+	u := managementBase + resourceID + "?api-version=" + cosmosSQLRoleAPIVersion
+	resp, err := c.get(context.Background(), u)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warn: resolveCosmosRole GET %s: %v\n", resourceID, err)
+		return "", "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "warn: resolveCosmosRole GET %s: status %d: %s\n", resourceID, resp.StatusCode, string(body))
+		return "", "", false
+	}
+	var result cosmosRoleAssignmentGet
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: resolveCosmosRole GET %s: decode response: %v\n", resourceID, err)
+		return "", "", false
+	}
+	principalID = result.Properties.PrincipalID
+	if principalID == "" {
+		// Nothing usable came back -- ok=false so the caller keeps its
+		// pre-existing best-effort-empty behavior rather than "succeeding"
+		// with an empty principal.
+		return "", "", false
+	}
+	roleDefID := result.Properties.RoleDefinitionID
+	if name, known := cosmosBuiltInRoleNames[lastPathSegment(roleDefID)]; known {
+		roleName = name
+	} else {
+		roleName = lastPathSegment(roleDefID)
+	}
+	return roleName, principalID, true
 }
 
 // fetchActivityLog runs the Activity Log query to full pagination completion
@@ -315,7 +410,7 @@ func (c *connector) fetchActivityLog(ctx context.Context) ([]*event.Event, time.
 		resp.Body.Close()
 
 		for _, entry := range result.Value {
-			evs, tsReliable, err := normalizeEntry(entry, c.subscriptionID)
+			evs, tsReliable, err := normalizeEntry(entry, c.subscriptionID, normalize.WithCosmosRoleResolver(c.resolveCosmosRole))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping entry: %v\n", err)
 				continue

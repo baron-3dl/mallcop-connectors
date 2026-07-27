@@ -292,6 +292,53 @@ func TestAzureCosmosSqlRoleAssignmentFanOut(t *testing.T) {
 	}
 }
 
+// TestAzureCosmosSqlRoleAssignmentWriteResolverFillsEmptyFields is the
+// mallcoppro-32e regression: a real Cosmos sqlRoleAssignments/write
+// BeginRequest event carries NO requestbody at all, so both flat properties
+// and the requestbody fallback leave role/principal empty. With a configured
+// CosmosRoleResolver, Azure() must call it and use its result to populate the
+// role_assignment Result's role/role_name and target_user/principal_id.
+func TestAzureCosmosSqlRoleAssignmentWriteResolverFillsEmptyFields(t *testing.T) {
+	entry := map[string]any{
+		"caller":     "attacker@corp.com",
+		"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod/sqlRoleAssignments/ra1",
+		// No "properties" at all -- mirrors the live-observed bodyless event.
+	}
+	resolver := func(resourceID string) (string, string, bool) {
+		if resourceID != entry["resourceId"] {
+			t.Errorf("resolver called with resourceID = %q, want %q", resourceID, entry["resourceId"])
+		}
+		return "Cosmos DB Built-in Data Contributor", "resolved-principal-guid", true
+	}
+	got := Azure("Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/write", entry, WithCosmosRoleResolver(resolver))
+	pe := wantType(t, got, "role_assignment")
+	pep := decode(t, pe, entry)
+	if pep["role"] != "Cosmos DB Built-in Data Contributor" || pep["role_name"] != "Cosmos DB Built-in Data Contributor" {
+		t.Errorf("role/role_name = %v/%v, want Cosmos DB Built-in Data Contributor", pep["role"], pep["role_name"])
+	}
+	if pep["target_user"] != "resolved-principal-guid" || pep["principal_id"] != "resolved-principal-guid" {
+		t.Errorf("target_user/principal_id = %v/%v, want resolved-principal-guid", pep["target_user"], pep["principal_id"])
+	}
+}
+
+// TestAzureCosmosSqlRoleAssignmentWriteNoResolverStaysEmpty pins the
+// no-regression / graceful-degradation half of mallcoppro-32e: with no
+// resolver configured (the default, e.g. every existing caller before this
+// change), a bodyless Cosmos sqlRoleAssignments/write entry keeps today's
+// best-effort empty role/principal rather than erroring or panicking.
+func TestAzureCosmosSqlRoleAssignmentWriteNoResolverStaysEmpty(t *testing.T) {
+	entry := map[string]any{
+		"caller":     "attacker@corp.com",
+		"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod/sqlRoleAssignments/ra1",
+	}
+	got := Azure("Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/write", entry)
+	pe := wantType(t, got, "role_assignment")
+	pep := decode(t, pe, entry)
+	if pep["role"] != nil || pep["target_user"] != nil {
+		t.Errorf("expected empty role/target_user with no resolver, got role=%v target_user=%v", pep["role"], pep["target_user"])
+	}
+}
+
 func TestAzureCosmosListKeysSecretAccess(t *testing.T) {
 	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod"}
 	r := wantType(t, Azure("Microsoft.DocumentDB/databaseAccounts/listKeys/action", entry), "secret_access")
@@ -435,6 +482,47 @@ func TestAzureSqlRoleAssignmentDeleteFanOut(t *testing.T) {
 	pep := decode(t, pe, entry)
 	if pep["target_user"] != "victim-principal" || pep["principal_id"] != "victim-principal" {
 		t.Errorf("role_assignment payload = %+v", pep)
+	}
+}
+
+// TestAzureCosmosSqlRoleAssignmentDeleteResolverFillsEmptyFields is the
+// mallcoppro-32e regression for the /delete side: same bodyless-event gap,
+// action stays "remove_role_assignment" (not "role_assignment") since this is
+// the delete-narrows-access case.
+func TestAzureCosmosSqlRoleAssignmentDeleteResolverFillsEmptyFields(t *testing.T) {
+	entry := map[string]any{
+		"caller":     "attacker@corp.com",
+		"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod/sqlRoleAssignments/ra1",
+	}
+	resolver := func(resourceID string) (string, string, bool) {
+		return "Cosmos DB Built-in Data Reader", "resolved-principal-guid-2", true
+	}
+	got := Azure("Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/delete", entry, WithCosmosRoleResolver(resolver))
+	pe := wantType(t, got, "role_assignment")
+	pep := decode(t, pe, entry)
+	if pep["role"] != "Cosmos DB Built-in Data Reader" || pep["role_name"] != "Cosmos DB Built-in Data Reader" {
+		t.Errorf("role/role_name = %v/%v, want Cosmos DB Built-in Data Reader", pep["role"], pep["role_name"])
+	}
+	if pep["target_user"] != "resolved-principal-guid-2" || pep["principal_id"] != "resolved-principal-guid-2" {
+		t.Errorf("target_user/principal_id = %v/%v, want resolved-principal-guid-2", pep["target_user"], pep["principal_id"])
+	}
+	if pep["action"] != "remove_role_assignment" {
+		t.Errorf("action = %v, want remove_role_assignment", pep["action"])
+	}
+}
+
+// TestAzureCosmosSqlRoleAssignmentDeleteNoResolverStaysEmpty is the
+// no-regression half for the /delete side.
+func TestAzureCosmosSqlRoleAssignmentDeleteNoResolverStaysEmpty(t *testing.T) {
+	entry := map[string]any{
+		"caller":     "attacker@corp.com",
+		"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod/sqlRoleAssignments/ra1",
+	}
+	got := Azure("Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/delete", entry)
+	pe := wantType(t, got, "role_assignment")
+	pep := decode(t, pe, entry)
+	if pep["role"] != nil || pep["target_user"] != nil {
+		t.Errorf("expected empty role/target_user with no resolver, got role=%v target_user=%v", pep["role"], pep["target_user"])
 	}
 }
 
