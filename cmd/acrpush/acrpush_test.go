@@ -109,8 +109,8 @@ func TestQueryOmitsTimespanWhenFloorZero(t *testing.T) {
 	if _, ok := gotBody["timespan"]; ok {
 		t.Errorf("timespan should be omitted when floor is zero, got %v", gotBody["timespan"])
 	}
-	if !strings.Contains(kqlQuery, `OperationName in ("Push", "Delete")`) {
-		t.Errorf("kqlQuery must filter to Push/Delete server-side")
+	if !strings.Contains(kqlQuery, `OperationName in ("Push", "Delete", "importImage")`) {
+		t.Errorf("kqlQuery must filter to Push/Delete/importImage server-side")
 	}
 }
 

@@ -79,6 +79,36 @@ func TestACRDeleteIsDependencyAddNotDirect(t *testing.T) {
 	}
 }
 
+// TestACRImportImageIsDependencyAddDirect asserts importImage (ACR's
+// operation for `az acr import`, verified live 2026-07-27 landing in
+// ContainerRegistryRepositoryEvents as its own distinct OperationName) reaches
+// the SAME gate Type as Push, "dependency_add", and sets Direct — an import
+// pulls an image from an arbitrary external source registry into ours, which
+// ADDS a new direct dependency exactly like a Push does, so
+// dependency_tamper.go's Rule 4 must fire on it too.
+func TestACRImportImageIsDependencyAddDirect(t *testing.T) {
+	got := ACR("importImage", "someimage", "v1",
+		"sha256:b6f9c3e2a1d8f7e6c5b4a3928170695847362f1e0d9c8b7a6958473625140abc",
+		"mallcop-deploy-sp", "20.42.10.7", "acrnostrrelayprod.azurecr.io", "Success")
+	if len(got) != 1 {
+		t.Fatalf("want 1 result, got %d: %+v", len(got), got)
+	}
+	r := got[0]
+	if r.Type != "dependency_add" {
+		t.Errorf("Type = %q, want dependency_add (dependency_tamper.go's gate literal)", r.Type)
+	}
+	p := decode(t, r, map[string]any{"OperationName": "importImage"})
+	if p["package"] != "someimage" {
+		t.Errorf("package = %v, want someimage", p["package"])
+	}
+	if p["direct"] != true {
+		t.Errorf("direct = %v, want true (importImage adds a new direct dependency, dependency_tamper.go Rule 4)", p["direct"])
+	}
+	if p["action"] != "importimage" {
+		t.Errorf("action = %v, want importimage", p["action"])
+	}
+}
+
 // TestACRPullFallsThroughToCatchAll asserts a read-shaped operation never
 // reaches dependency_add — Pull carries no supply-chain-mutation signal.
 // (Defensive: cmd/acrpush's KQL already filters OperationName server-side to
