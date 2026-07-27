@@ -297,6 +297,89 @@ func TestFetchActivityLogMissingTimestampDoesNotPoisonMaxSeen(t *testing.T) {
 	}
 }
 
+// mallcoppro-38c: --exclude-resource-group must drop events whose resourceId
+// falls under an excluded RG (e.g. throwaway bench infra sharing a
+// subscription with the monitored resource) while still advancing the
+// cursor past those entries' timestamps — otherwise every future run
+// re-fetches (and re-discards) the same excluded backlog forever.
+func TestExtractResourceGroup(t *testing.T) {
+	cases := []struct {
+		name       string
+		resourceID string
+		want       string
+	}{
+		{"lowercase segment", "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.App/containerApps/nostr-relay-prod", "nostr-relay-prod"},
+		{"inconsistent casing", "/subscriptions/s/resourcegroups/nostr-relay-bench/providers/Microsoft.App/containerApps/x", "nostr-relay-bench"},
+		{"subscription-scoped, no RG segment", "/subscriptions/s/providers/Microsoft.Authorization/roleAssignments/x", ""},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractResourceGroup(tc.resourceID)
+			if got != tc.want {
+				t.Errorf("extractResourceGroup(%q) = %q, want %q", tc.resourceID, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestConnectorIsExcluded(t *testing.T) {
+	c := &connector{excludeResourceGroups: map[string]bool{"nostr-relay-bench": true}}
+
+	excluded := map[string]interface{}{"resourceId": "/subscriptions/s/resourceGroups/Nostr-Relay-Bench/providers/Microsoft.App/containerApps/x"}
+	if !c.isExcluded(excluded) {
+		t.Error("expected bench RG entry (mixed case) to be excluded")
+	}
+
+	notExcluded := map[string]interface{}{"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.App/containerApps/x"}
+	if c.isExcluded(notExcluded) {
+		t.Error("expected prod RG entry to NOT be excluded")
+	}
+
+	noRG := map[string]interface{}{"resourceId": "/subscriptions/s/providers/Microsoft.Authorization/roleAssignments/x"}
+	if c.isExcluded(noRG) {
+		t.Error("expected subscription-scoped entry (no RG segment) to NOT be excluded")
+	}
+
+	empty := &connector{}
+	if empty.isExcluded(excluded) {
+		t.Error("expected connector with no excludeResourceGroups to never exclude")
+	}
+}
+
+func TestFetchActivityLogExcludesResourceGroupButStillAdvancesCursor(t *testing.T) {
+	page := []map[string]interface{}{
+		{"id": "1", "eventTimestamp": "2024-06-01T12:00:00Z", "caller": "prod-actor", "resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.App/containerApps/nostr-relay-prod"},
+		// Later timestamp, but in the excluded bench RG: must not be emitted,
+		// yet its timestamp must still be the one that wins maxSeen.
+		{"id": "2", "eventTimestamp": "2024-06-01T13:30:00Z", "caller": "bench-actor", "resourceId": "/subscriptions/s/resourceGroups/nostr-relay-bench/providers/Microsoft.App/containerApps/nostr-relay-bench"},
+	}
+	srv := serveActivityLogPages(t, [][]map[string]interface{}{page})
+	defer srv.Close()
+	defer activityLogBaseOverride(srv.URL)()
+
+	conn := &connector{
+		client:                srv.Client(),
+		accessToken:           "tok",
+		subscriptionID:        "sub-excl",
+		excludeResourceGroups: map[string]bool{"nostr-relay-bench": true},
+	}
+	events, maxSeen, err := conn.fetchActivityLog(context.Background())
+	if err != nil {
+		t.Fatalf("fetchActivityLog: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("want 1 event (bench RG excluded), got %d", len(events))
+	}
+	if events[0].Actor != "prod-actor" {
+		t.Errorf("emitted event Actor = %q, want %q (bench entry must not leak through)", events[0].Actor, "prod-actor")
+	}
+	want := time.Date(2024, 6, 1, 13, 30, 0, 0, time.UTC)
+	if !maxSeen.Equal(want) {
+		t.Fatalf("maxSeen = %v, want %v (excluded entry's timestamp must still advance the cursor, or its backlog is re-fetched forever)", maxSeen, want)
+	}
+}
+
 // (b) resume with a timestamp cursor queries from that timestamp
 // inclusively — assert the actual $filter request parameter reflects T.
 func TestFetchActivityLogResumeUsesInclusiveFilter(t *testing.T) {

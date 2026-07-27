@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	azure --subscription-id <id> [--since <iso-timestamp>] [--cursor <cursor>]
+//	azure --subscription-id <id> [--since <iso-timestamp>] [--cursor <cursor>] [--exclude-resource-group <name> ...]
 //
 // Auth: service principal via AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET.
 package main
@@ -277,11 +277,53 @@ type activityLogResponse struct {
 	NextLink string                   `json:"nextLink"`
 }
 
+// resourceGroupRE extracts the resourceGroups/{name} segment from an ARM
+// resourceId, case-insensitively. Azure's own casing for this segment is
+// inconsistent across providers (observed for dnsZones vs dnszones in
+// mallcoppro-d63), so matching is case-insensitive and callers must also
+// lowercase before comparing against excludeResourceGroups.
+var resourceGroupRE = regexp.MustCompile(`(?i)/resourcegroups/([^/]+)`)
+
+// extractResourceGroup returns the resource group name from an ARM
+// resourceId, or "" if the ID has no resourceGroups segment (e.g.
+// subscription-scoped operations).
+func extractResourceGroup(resourceID string) string {
+	m := resourceGroupRE.FindStringSubmatch(resourceID)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
 type connector struct {
 	client         *http.Client
 	accessToken    string
 	subscriptionID string
 	since          time.Time // effective query floor: max(--since, cursor high-water mark)
+
+	// excludeResourceGroups holds lowercased resource group names whose
+	// Activity Log entries are fetched (so the cursor still advances past
+	// them) but never emitted as events (mallcoppro-38c: a subscription-wide
+	// poller otherwise surfaces control-plane noise from throwaway/bench
+	// infra sharing the subscription with the monitored resource, poisoning
+	// baselines with actors/contexts that are not part of the monitored
+	// system). Empty means no exclusion (all resource groups emitted).
+	excludeResourceGroups map[string]bool
+}
+
+// isExcluded reports whether entry's resourceId falls under one of
+// c.excludeResourceGroups. An entry with no resourceGroups segment (e.g. a
+// subscription-scoped operation) is never excluded.
+func (c *connector) isExcluded(entry map[string]interface{}) bool {
+	if len(c.excludeResourceGroups) == 0 {
+		return false
+	}
+	resourceID, _ := entry["resourceId"].(string)
+	rg := extractResourceGroup(resourceID)
+	if rg == "" {
+		return false
+	}
+	return c.excludeResourceGroups[strings.ToLower(rg)]
 }
 
 func (c *connector) get(ctx context.Context, rawURL string) (*http.Response, error) {
@@ -415,12 +457,15 @@ func (c *connector) fetchActivityLog(ctx context.Context) ([]*event.Event, time.
 				fmt.Fprintf(os.Stderr, "warn: skipping entry: %v\n", err)
 				continue
 			}
-			allEvents = append(allEvents, evs...)
 			// Only a real source timestamp may advance the resume high-water
 			// mark. A fabricated time.Now() fallback (missing/unparseable
 			// eventTimestamp) must never poison maxSeen to "now" — that would
 			// silently skip every real event between the true high-water
-			// mark and now on the next run.
+			// mark and now on the next run. This must happen BEFORE the
+			// exclusion check below: an excluded resource group's entries
+			// still occupy the query window, so the cursor must still walk
+			// past them or every future run re-fetches (and re-discards)
+			// the same excluded backlog forever.
 			if tsReliable {
 				for _, ev := range evs {
 					if ev.Timestamp.After(maxSeen) {
@@ -428,6 +473,10 @@ func (c *connector) fetchActivityLog(ctx context.Context) ([]*event.Event, time.
 					}
 				}
 			}
+			if c.isExcluded(entry) {
+				continue
+			}
+			allEvents = append(allEvents, evs...)
 		}
 
 		if result.NextLink == "" {
@@ -439,12 +488,25 @@ func (c *connector) fetchActivityLog(ctx context.Context) ([]*event.Event, time.
 	return allEvents, maxSeen, nil
 }
 
+// stringSliceFlag implements flag.Value to support a repeatable
+// --exclude-resource-group flag (the stdlib flag package has no built-in
+// repeated-flag type). Matches cmd/nostr's identical --relay-url idiom.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string { return strings.Join(*s, ",") }
+func (s *stringSliceFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 func run() error {
 	var (
 		subscriptionID = flag.String("subscription-id", "", "Azure subscription ID")
 		since          = flag.String("since", "", "ISO 8601 timestamp to filter events (e.g. 2024-01-01T00:00:00Z)")
 		cursorArg      = flag.String("cursor", "", "Checkpoint cursor from previous run (HMAC-signed)")
+		excludeRG      stringSliceFlag
 	)
+	flag.Var(&excludeRG, "exclude-resource-group", "resource group name to exclude from emitted events (repeatable, case-insensitive); the cursor still advances past its entries")
 	flag.Parse()
 
 	if *subscriptionID == "" {
@@ -484,11 +546,20 @@ func run() error {
 		return fmt.Errorf("get access token: %w", err)
 	}
 
+	var excludeMap map[string]bool
+	if len(excludeRG) > 0 {
+		excludeMap = make(map[string]bool, len(excludeRG))
+		for _, rg := range excludeRG {
+			excludeMap[strings.ToLower(rg)] = true
+		}
+	}
+
 	conn := &connector{
-		client:         http.DefaultClient,
-		accessToken:    token,
-		subscriptionID: *subscriptionID,
-		since:          floor,
+		client:                http.DefaultClient,
+		accessToken:           token,
+		subscriptionID:        *subscriptionID,
+		since:                 floor,
+		excludeResourceGroups: excludeMap,
 	}
 
 	ctx := context.Background()
