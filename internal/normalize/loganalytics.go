@@ -149,8 +149,28 @@ func LogAnalytics(decision, pubkey, remote, domain, detail string) []Result {
 		set(cd, "resource_name", "nostr-relay")
 		set(cd, "policy_name", method)
 		cd["change_description"] = "NIP-86 admin call: " + detail
-		pe := map[string]any{"action": "role_assignment"}
-		set(pe, "role", method)
+		// priv-escalation fan-out: mirror azure.go's sqlRoleAssignments
+		// write-vs-delete split so the GENERIC priv-escalation gate reads a
+		// GRANT as an elevation and a REVOKE as a narrowing — no new detector
+		// rule, and no NIP-86 method vocabulary leaks into priv-escalation's
+		// cross-cloud elevated-keyword set (mallcoppro-956). allowpubkey grants
+		// a pubkey relay-write-allowlist membership (an elevation): action
+		// "role_assignment" with a role carrying the "write" token
+		// priv-escalation already recognizes. banpubkey REVOKES it (a
+		// narrowing): action "remove_role_assignment", which trips isElevated's
+		// remove/revoke guard so priv-escalation stays quiet — config_drift
+		// still surfaces the ban via the iam_policy_attach leg. Previously role
+		// carried the raw method name ("allowpubkey"), which matched no elevated
+		// keyword, so priv-escalation never cast its committee vote for a genuine
+		// write grant. The raw method stays in policy_name (config-drift leg) and
+		// role_name (priv-escalation leg) for evidence fidelity.
+		peAction := "role_assignment"
+		if method == "banpubkey" {
+			peAction = "remove_role_assignment"
+		}
+		pe := map[string]any{"action": peAction}
+		set(pe, "role", "relay-write-allowlist")
+		set(pe, "role_name", method)
 		set(pe, "target_user", pubkey)
 		set(pe, "principal_id", pubkey)
 		set(pe, "resource_name", "nostr-relay")

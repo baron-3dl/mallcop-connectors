@@ -97,8 +97,18 @@ func TestLogAnalyticsNIP86AllowlistGrantFanOut(t *testing.T) {
 
 	pe := wantType(t, got, "role_assignment")
 	pep := decode(t, pe, map[string]any{})
-	if pep["role"] != "allowpubkey" {
-		t.Errorf("role_assignment role = %v, want allowpubkey", pep["role"])
+	// allowpubkey is a GRANT: role carries the "write" token priv-escalation
+	// recognizes (so it casts its committee vote), action stays "role_assignment"
+	// (not a narrowing), and the raw method survives in role_name for fidelity
+	// (mallcoppro-956).
+	if pep["role"] != "relay-write-allowlist" {
+		t.Errorf("role_assignment role = %v, want relay-write-allowlist", pep["role"])
+	}
+	if pep["role_name"] != "allowpubkey" {
+		t.Errorf("role_assignment role_name = %v, want allowpubkey", pep["role_name"])
+	}
+	if pep["action"] != "role_assignment" {
+		t.Errorf("role_assignment action = %v, want role_assignment (a grant is an elevation)", pep["action"])
 	}
 	if pep["target_user"] != "adminpubkeyhex" {
 		t.Errorf("role_assignment target_user = %v, want adminpubkeyhex", pep["target_user"])
@@ -121,6 +131,15 @@ func TestLogAnalyticsNIP86AllowlistRevokeDenyStillFansOut(t *testing.T) {
 	types := map[string]bool{got[0].Type: true, got[1].Type: true}
 	if !types["iam_policy_attach"] || !types["role_assignment"] {
 		t.Errorf("want iam_policy_attach + role_assignment, got %v", types)
+	}
+	// banpubkey is a REVOKE, not an elevation: the role_assignment leg carries
+	// action "remove_role_assignment" so priv-escalation's remove/revoke guard
+	// drops it (no priv-escalation vote), while config_drift still surfaces the
+	// ban via the iam_policy_attach leg (mallcoppro-956).
+	pe := wantType(t, got, "role_assignment")
+	pep := decode(t, pe, map[string]any{})
+	if pep["action"] != "remove_role_assignment" {
+		t.Errorf("banpubkey role_assignment action = %v, want remove_role_assignment (a revoke narrows, not elevates)", pep["action"])
 	}
 }
 
