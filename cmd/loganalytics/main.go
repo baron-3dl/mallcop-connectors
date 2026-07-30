@@ -1,5 +1,5 @@
 // Command loganalytics is a one-shot poller of the Azure Log Analytics query
-// API (mallcoppro-9701). It surfaces the nostr-relay's application-plane
+// API (mallcoppro-9701). It surfaces the example-project's application-plane
 // relay_security structured log lines (mallcoppro-813) as normalized mallcop
 // events, narrowed (mallcoppro-f1a) to only the AUTHORIZATION-BOUNDARY
 // signals: allowlist-breach probing (unauthorized_writer / nip42_auth_failure)
@@ -48,7 +48,7 @@ const (
 	// lawScope is the AAD app ID URI scope for the Log Analytics Data Query
 	// API — the client-credentials analog of the `--resource
 	// https://api.loganalytics.io` argument to `az account get-access-token`
-	// (verified live against law-nostr-relay-prod with an operator token
+	// (verified live against law-example with an operator token
 	// obtained the same way, 2026-07-21; the SP's own client-credential
 	// token is unverified pending mallcoppro-4b0 — the SP secret is a
 	// write-only GH secret this agent cannot read).
@@ -59,23 +59,30 @@ const (
 // instead of the real Log Analytics endpoint.
 var queryBase = "https://api.loganalytics.io/v1/workspaces/%s/query"
 
+// managementBase is the ARM control-plane host. The scan path never touches it;
+// --doctor does, for the ALTERNATE-SCOPE probe that tells resource-context
+// access mode apart from a missing role assignment (see internal/doctor).
+// A var (not const), mirroring cmd/azure's idiom, so tests can point it at an
+// httptest.Server.
+var managementBase = "https://management.azure.com"
+
 // kqlQuery is THE query, verbatim, every run — a constant string, never
 // string-interpolated with config or the time window. The container app
-// name (nostr-relay-prod) is a fixed literal, not a runtime parameter: this
+// name (example-rg) is a fixed literal, not a runtime parameter: this
 // connector has exactly one target, the relay's own console log stream. The
 // time window is bound separately via the request body's "timespan" field
 // (see connector.query), which is the Log Analytics API's own parameterized
 // mechanism for restricting TimeGenerated — never a KQL `where` clause built
 // from a Go format/concat of the cursor or --since value.
 //
-// Confirmed live against law-nostr-relay-prod (2026-07-21, operator token):
+// Confirmed live against law-example (2026-07-21, operator token):
 // returns exactly the mallcoppro-813 unauthorized-write probe row, shape
 // {"tables":[{"name":"PrimaryResult","columns":[{"name":"TimeGenerated",...},
 // {"name":"Log_s",...}],"rows":[["<ts>","<relay_security JSON line>"]]}]}.
 // See internal/normalize/testdata/law_unauthorized_writer_response.json for
 // the captured fixture.
 const kqlQuery = `ContainerAppConsoleLogs_CL
-| where ContainerAppName_s == "nostr-relay-prod"
+| where ContainerAppName_s == "example-rg"
 | where Log_s has "relay_security"
 | order by TimeGenerated asc
 | project TimeGenerated, Log_s`
@@ -233,39 +240,54 @@ type connector struct {
 // available retention window, mirroring cmd/azure's behavior when its
 // $filter is unset).
 func (c *connector) query(ctx context.Context, since time.Time) (*lawQueryResponse, error) {
+	status, body, err := c.queryRaw(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("Log Analytics API error %d: %s", status, body)
+	}
+
+	var result lawQueryResponse
+	if err := json.Unmarshal([]byte(body), &result); err != nil {
+		return nil, fmt.Errorf("decode query response: %w", err)
+	}
+	return &result, nil
+}
+
+// queryRaw issues THE query and hands back the raw status and body. query()
+// is its only scan-path caller; --doctor calls it directly so the doctor
+// diagnoses the exact request the connector really makes, rather than a
+// parallel reimplementation of it that could succeed while the real one 403s.
+func (c *connector) queryRaw(ctx context.Context, since time.Time) (int, string, error) {
 	body := map[string]any{"query": kqlQuery}
 	if !since.IsZero() {
 		body["timespan"] = since.UTC().Format(time.RFC3339) + "/" + time.Now().UTC().Format(time.RFC3339)
 	}
 	b, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("marshal query body: %w", err)
+		return 0, "", fmt.Errorf("marshal query body: %w", err)
 	}
 
 	u := fmt.Sprintf(queryBase, c.workspaceID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(b))
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return 0, "", fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.accessToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("POST %s: %w", u, err)
+		return 0, "", fmt.Errorf("POST %s: %w", u, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Log Analytics API error %d: %s", resp.StatusCode, string(respBody))
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, "", fmt.Errorf("read query response: %w", err)
 	}
-
-	var result lawQueryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode query response: %w", err)
-	}
-	return &result, nil
+	return resp.StatusCode, string(respBody), nil
 }
 
 func columnIndex(cols []lawColumn, name string) int {
@@ -373,6 +395,7 @@ func run() error {
 		workspaceResourceID = flag.String("workspace-resource-id", "", "Log Analytics workspace ARM resource ID (optional; recorded as the event Org)")
 		since               = flag.String("since", "", "ISO 8601 timestamp to filter events (e.g. 2024-01-01T00:00:00Z)")
 		cursorArg           = flag.String("cursor", "", "Checkpoint cursor from previous run (HMAC-signed)")
+		doctorMode          = flag.Bool("doctor", false, "Self-diagnose this connector's Azure access and print one JSON DiagnosisReport on stdout, instead of scanning")
 	)
 	flag.Parse()
 
@@ -393,6 +416,17 @@ func run() error {
 	tenantID := os.Getenv("AZURE_TENANT_ID")
 	clientID := os.Getenv("AZURE_CLIENT_ID")
 	clientSecret := os.Getenv("AZURE_CLIENT_SECRET")
+
+	// --doctor short-circuits BEFORE the credential precondition below: a
+	// connector with no usable credential is exactly one of the states the
+	// doctor exists to name, so it must produce a report rather than the same
+	// bare error the operator already could not act on.
+	if *doctorMode {
+		return runDoctor(context.Background(), os.Stdout,
+			doctorConnectorID(*workspaceResourceID, *workspaceID),
+			*workspaceID, *workspaceResourceID, tenantID, clientID, clientSecret)
+	}
+
 	if tenantID == "" || clientID == "" || clientSecret == "" {
 		return fmt.Errorf("AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET must be set")
 	}

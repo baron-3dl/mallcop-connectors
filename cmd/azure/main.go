@@ -152,8 +152,12 @@ type azureTokenResponse struct {
 	ExpiresIn   int    `json:"expires_in"`
 }
 
+// tokenEndpoint is a var (not const) so tests can point token minting at an
+// httptest.Server, mirroring cmd/loganalytics' idiom.
+var tokenEndpoint = tokenEndpointFn
+
 func getAccessToken(tenantID, clientID, clientSecret string) (string, error) {
-	tokenURL := fmt.Sprintf(tokenEndpointFn, tenantID)
+	tokenURL := fmt.Sprintf(tokenEndpoint, tenantID)
 	vals := url.Values{
 		"grant_type":    {"client_credentials"},
 		"client_id":     {clientID},
@@ -444,6 +448,7 @@ func run() error {
 		subscriptionID = flag.String("subscription-id", "", "Azure subscription ID")
 		since          = flag.String("since", "", "ISO 8601 timestamp to filter events (e.g. 2024-01-01T00:00:00Z)")
 		cursorArg      = flag.String("cursor", "", "Checkpoint cursor from previous run (HMAC-signed)")
+		doctorMode     = flag.Bool("doctor", false, "Self-diagnose this connector's Azure access and print one JSON DiagnosisReport on stdout, instead of scanning")
 	)
 	flag.Parse()
 
@@ -457,6 +462,15 @@ func run() error {
 	tenantID := os.Getenv("AZURE_TENANT_ID")
 	clientID := os.Getenv("AZURE_CLIENT_ID")
 	clientSecret := os.Getenv("AZURE_CLIENT_SECRET")
+
+	// --doctor short-circuits BEFORE the credential precondition below: a
+	// connector with no usable credential is exactly one of the states the
+	// doctor exists to name, so it must produce a report rather than the same
+	// bare error the operator already could not act on.
+	if *doctorMode {
+		return runDoctor(context.Background(), os.Stdout, *subscriptionID, tenantID, clientID, clientSecret)
+	}
+
 	if tenantID == "" || clientID == "" || clientSecret == "" {
 		return fmt.Errorf("AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET must be set")
 	}
